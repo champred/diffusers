@@ -63,24 +63,27 @@ class DiffusionPipeline(ConfigMixin):
         from diffusers import pipelines
 
         for name, module in kwargs.items():
-            # retrive library
-            library = module.__module__.split(".")[0]
+            if module is None:
+                register_dict = {name: (None, None)}
+            else:
+                # retrive library
+                library = module.__module__.split(".")[0]
 
-            # check if the module is a pipeline module
-            pipeline_dir = module.__module__.split(".")[-2]
-            path = module.__module__.split(".")
-            is_pipeline_module = pipeline_dir in path and hasattr(pipelines, pipeline_dir)
+                # check if the module is a pipeline module
+                pipeline_dir = module.__module__.split(".")[-2]
+                path = module.__module__.split(".")
+                is_pipeline_module = pipeline_dir in path and hasattr(pipelines, pipeline_dir)
 
-            # if library is not in LOADABLE_CLASSES, then it is a custom module.
-            # Or if it's a pipeline module, then the module is inside the pipeline
-            # folder so we set the library to module name.
-            if library not in LOADABLE_CLASSES or is_pipeline_module:
-                library = pipeline_dir
+                # if library is not in LOADABLE_CLASSES, then it is a custom module.
+                # Or if it's a pipeline module, then the module is inside the pipeline
+                # folder so we set the library to module name.
+                if library not in LOADABLE_CLASSES or is_pipeline_module:
+                    library = pipeline_dir
 
-            # retrive class_name
-            class_name = module.__class__.__name__
+                # retrive class_name
+                class_name = module.__class__.__name__
 
-            register_dict = {name: (library, class_name)}
+                register_dict = {name: (library, class_name)}
 
             # save model index config
             self.register_to_config(**register_dict)

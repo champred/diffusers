@@ -1,19 +1,18 @@
 from pathlib import Path
-from diffusers import StableDiffusionPipeline, LMSDiscreteScheduler
+from diffusers import StableDiffusionPipeline, EulerDiscreteScheduler
 import torch
 from transformers import CLIPTextModel
 
-
-text_encoder = CLIPTextModel.from_pretrained("openai/clip-vit-large-patch14", return_dict=False)
+text_encoder = CLIPTextModel.from_pretrained("openai/clip-vit-large-patch14")
 
 torch.manual_seed(42)
-lms = LMSDiscreteScheduler(
+euler = EulerDiscreteScheduler(
     beta_start=0.00085, 
     beta_end=0.012, 
     beta_schedule="scaled_linear"
 )
 
-pipe = StableDiffusionPipeline.from_pretrained("CompVis/stable-diffusion-v1-4", scheduler=lms, use_auth_token=True)
+pipe = StableDiffusionPipeline.from_pretrained("CompVis/stable-diffusion-v1-4", scheduler=euler, use_auth_token=True)
 
 def convert_to_onnx(unet, post_quant_conv, decoder, text_encoder, height=512, width=512):
     """Convert given input models to onnx files.

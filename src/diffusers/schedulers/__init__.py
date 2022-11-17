@@ -24,7 +24,7 @@ from .scheduling_pndm import PNDMScheduler
 from .scheduling_sde_ve import ScoreSdeVeScheduler
 from .scheduling_sde_vp import ScoreSdeVpScheduler
 from .scheduling_utils import SchedulerMixin
-
+from .scheduling_euler_discrete import EulerDiscreteScheduler
 
 if is_scipy_available():
     from .scheduling_lms_discrete import LMSDiscreteScheduler

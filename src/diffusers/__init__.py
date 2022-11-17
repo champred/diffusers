@@ -26,6 +26,7 @@ from .schedulers import (
     PNDMScheduler,
     SchedulerMixin,
     ScoreSdeVeScheduler,
+    EulerDiscreteScheduler
 )
 
 
