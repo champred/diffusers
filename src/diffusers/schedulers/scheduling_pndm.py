@@ -1,4 +1,4 @@
-# Copyright 2022 Zhejiang University Team and The HuggingFace Team. All rights reserved.
+# Copyright 2023 Zhejiang University Team and The HuggingFace Team. All rights reserved.
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
 # you may not use this file except in compliance with the License.
@@ -15,25 +15,32 @@
 # DISCLAIMER: This file is strongly influenced by https://github.com/ermongroup/ddim
 
 import math
-from typing import Union
+from typing import List, Optional, Tuple, Union
 
 import numpy as np
 import torch
 
 from ..configuration_utils import ConfigMixin, register_to_config
-from .scheduling_utils import SchedulerMixin
+from .scheduling_utils import KarrasDiffusionSchedulers, SchedulerMixin, SchedulerOutput
 
 
+# Copied from diffusers.schedulers.scheduling_ddpm.betas_for_alpha_bar
 def betas_for_alpha_bar(num_diffusion_timesteps, max_beta=0.999):
     """
     Create a beta schedule that discretizes the given alpha_t_bar function, which defines the cumulative product of
     (1-beta) over time from t = [0,1].
 
-    :param num_diffusion_timesteps: the number of betas to produce. :param alpha_bar: a lambda that takes an argument t
-    from 0 to 1 and
-                      produces the cumulative product of (1-beta) up to that part of the diffusion process.
-    :param max_beta: the maximum beta to use; use values lower than 1 to
+    Contains a function alpha_bar that takes an argument t and transforms it to the cumulative product of (1-beta) up
+    to that part of the diffusion process.
+
+
+    Args:
+        num_diffusion_timesteps (`int`): the number of betas to produce.
+        max_beta (`float`): the maximum beta to use; use values lower than 1 to
                      prevent singularities.
+
+    Returns:
+        betas (`np.ndarray`): the betas used by the scheduler to step the model outputs
     """
 
     def alpha_bar(time_step):
@@ -44,26 +51,72 @@ def betas_for_alpha_bar(num_diffusion_timesteps, max_beta=0.999):
         t1 = i / num_diffusion_timesteps
         t2 = (i + 1) / num_diffusion_timesteps
         betas.append(min(1 - alpha_bar(t2) / alpha_bar(t1), max_beta))
-    return np.array(betas, dtype=np.float32)
+    return torch.tensor(betas, dtype=torch.float32)
 
 
 class PNDMScheduler(SchedulerMixin, ConfigMixin):
+    """
+    Pseudo numerical methods for diffusion models (PNDM) proposes using more advanced ODE integration techniques,
+    namely Runge-Kutta method and a linear multi-step method.
+
+    [`~ConfigMixin`] takes care of storing all config attributes that are passed in the scheduler's `__init__`
+    function, such as `num_train_timesteps`. They can be accessed via `scheduler.config.num_train_timesteps`.
+    [`SchedulerMixin`] provides general loading and saving functionality via the [`SchedulerMixin.save_pretrained`] and
+    [`~SchedulerMixin.from_pretrained`] functions.
+
+    For more details, see the original paper: https://arxiv.org/abs/2202.09778
+
+    Args:
+        num_train_timesteps (`int`): number of diffusion steps used to train the model.
+        beta_start (`float`): the starting `beta` value of inference.
+        beta_end (`float`): the final `beta` value.
+        beta_schedule (`str`):
+            the beta schedule, a mapping from a beta range to a sequence of betas for stepping the model. Choose from
+            `linear`, `scaled_linear`, or `squaredcos_cap_v2`.
+        trained_betas (`np.ndarray`, optional):
+            option to pass an array of betas directly to the constructor to bypass `beta_start`, `beta_end` etc.
+        skip_prk_steps (`bool`):
+            allows the scheduler to skip the Runge-Kutta steps that are defined in the original paper as being required
+            before plms steps; defaults to `False`.
+        set_alpha_to_one (`bool`, default `False`):
+            each diffusion step uses the value of alphas product at that step and at the previous one. For the final
+            step there is no previous alpha. When this option is `True` the previous alpha product is fixed to `1`,
+            otherwise it uses the value of alpha at step 0.
+        prediction_type (`str`, default `epsilon`, optional):
+            prediction type of the scheduler function, one of `epsilon` (predicting the noise of the diffusion process)
+            or `v_prediction` (see section 2.4 https://imagen.research.google/video/paper.pdf)
+        steps_offset (`int`, default `0`):
+            an offset added to the inference steps. You can use a combination of `offset=1` and
+            `set_alpha_to_one=False`, to make the last step use step 0 for the previous alpha product, as done in
+            stable diffusion.
+
+    """
+
+    _compatibles = [e.name for e in KarrasDiffusionSchedulers]
+    order = 1
+
     @register_to_config
     def __init__(
         self,
-        num_train_timesteps=1000,
-        beta_start=0.0001,
-        beta_end=0.02,
-        beta_schedule="linear",
-        tensor_format="pt",
-        skip_prk_steps=False,
+        num_train_timesteps: int = 1000,
+        beta_start: float = 0.0001,
+        beta_end: float = 0.02,
+        beta_schedule: str = "linear",
+        trained_betas: Optional[Union[np.ndarray, List[float]]] = None,
+        skip_prk_steps: bool = False,
+        set_alpha_to_one: bool = False,
+        prediction_type: str = "epsilon",
+        steps_offset: int = 0,
     ):
-
-        if beta_schedule == "linear":
-            self.betas = np.linspace(beta_start, beta_end, num_train_timesteps, dtype=np.float32)
+        if trained_betas is not None:
+            self.betas = torch.tensor(trained_betas, dtype=torch.float32)
+        elif beta_schedule == "linear":
+            self.betas = torch.linspace(beta_start, beta_end, num_train_timesteps, dtype=torch.float32)
         elif beta_schedule == "scaled_linear":
             # this schedule is very specific to the latent diffusion model.
-            self.betas = np.linspace(beta_start**0.5, beta_end**0.5, num_train_timesteps, dtype=np.float32) ** 2
+            self.betas = (
+                torch.linspace(beta_start**0.5, beta_end**0.5, num_train_timesteps, dtype=torch.float32) ** 2
+            )
         elif beta_schedule == "squaredcos_cap_v2":
             # Glide cosine schedule
             self.betas = betas_for_alpha_bar(num_train_timesteps)
@@ -71,9 +124,12 @@ class PNDMScheduler(SchedulerMixin, ConfigMixin):
             raise NotImplementedError(f"{beta_schedule} does is not implemented for {self.__class__}")
 
         self.alphas = 1.0 - self.betas
-        self.alphas_cumprod = np.cumprod(self.alphas, axis=0)
+        self.alphas_cumprod = torch.cumprod(self.alphas, dim=0)
 
-        self.one = np.array(1.0)
+        self.final_alpha_cumprod = torch.tensor(1.0) if set_alpha_to_one else self.alphas_cumprod[0]
+
+        # standard deviation of the initial noise distribution
+        self.init_noise_sigma = 1.0
 
         # For now we only support F-PNDM, i.e. the runge-kutta method
         # For more information on the algorithm please take a look at the paper: https://arxiv.org/pdf/2202.09778.pdf
@@ -89,21 +145,25 @@ class PNDMScheduler(SchedulerMixin, ConfigMixin):
         # setable values
         self.num_inference_steps = None
         self._timesteps = np.arange(0, num_train_timesteps)[::-1].copy()
-        self._offset = 0
         self.prk_timesteps = None
         self.plms_timesteps = None
         self.timesteps = None
 
-        self.tensor_format = tensor_format
-        self.set_format(tensor_format=tensor_format)
+    def set_timesteps(self, num_inference_steps: int, device: Union[str, torch.device] = None):
+        """
+        Sets the discrete timesteps used for the diffusion chain. Supporting function to be run before inference.
 
-    def set_timesteps(self, num_inference_steps, offset=0):
+        Args:
+            num_inference_steps (`int`):
+                the number of diffusion steps used when generating samples with a pre-trained model.
+        """
+
         self.num_inference_steps = num_inference_steps
-        self._timesteps = list(
-            range(0, self.config.num_train_timesteps, self.config.num_train_timesteps // num_inference_steps)
-        )
-        self._offset = offset
-        self._timesteps = np.array([t + self._offset for t in self._timesteps])
+        step_ratio = self.config.num_train_timesteps // self.num_inference_steps
+        # creates integer timesteps by multiplying by ratio
+        # casting to int to avoid issues when num_inference_step is power of 3
+        self._timesteps = (np.arange(0, num_inference_steps) * step_ratio).round()
+        self._timesteps += self.config.steps_offset
 
         if self.config.skip_prk_steps:
             # for some models like stable diffusion the prk steps can/should be skipped to
@@ -122,32 +182,66 @@ class PNDMScheduler(SchedulerMixin, ConfigMixin):
                 ::-1
             ].copy()  # we copy to avoid having negative strides which are not supported by torch.from_numpy
 
-        self.timesteps = np.concatenate([self.prk_timesteps, self.plms_timesteps]).astype(np.int64)
+        timesteps = np.concatenate([self.prk_timesteps, self.plms_timesteps]).astype(np.int64)
+        self.timesteps = torch.from_numpy(timesteps).to(device)
 
         self.ets = []
         self.counter = 0
-        self.set_format(tensor_format=self.tensor_format)
+        self.cur_model_output = 0
 
     def step(
         self,
-        model_output: Union[torch.FloatTensor, np.ndarray],
+        model_output: torch.FloatTensor,
         timestep: int,
-        sample: Union[torch.FloatTensor, np.ndarray],
-    ):
+        sample: torch.FloatTensor,
+        return_dict: bool = True,
+    ) -> Union[SchedulerOutput, Tuple]:
+        """
+        Predict the sample at the previous timestep by reversing the SDE. Core function to propagate the diffusion
+        process from the learned model outputs (most often the predicted noise).
+
+        This function calls `step_prk()` or `step_plms()` depending on the internal variable `counter`.
+
+        Args:
+            model_output (`torch.FloatTensor`): direct output from learned diffusion model.
+            timestep (`int`): current discrete timestep in the diffusion chain.
+            sample (`torch.FloatTensor`):
+                current instance of sample being created by diffusion process.
+            return_dict (`bool`): option for returning tuple rather than SchedulerOutput class
+
+        Returns:
+            [`~schedulers.scheduling_utils.SchedulerOutput`] or `tuple`:
+            [`~schedulers.scheduling_utils.SchedulerOutput`] if `return_dict` is True, otherwise a `tuple`. When
+            returning a tuple, the first element is the sample tensor.
+
+        """
         if self.counter < len(self.prk_timesteps) and not self.config.skip_prk_steps:
-            return self.step_prk(model_output=model_output, timestep=timestep, sample=sample)
+            return self.step_prk(model_output=model_output, timestep=timestep, sample=sample, return_dict=return_dict)
         else:
-            return self.step_plms(model_output=model_output, timestep=timestep, sample=sample)
+            return self.step_plms(model_output=model_output, timestep=timestep, sample=sample, return_dict=return_dict)
 
     def step_prk(
         self,
-        model_output: Union[torch.FloatTensor, np.ndarray],
+        model_output: torch.FloatTensor,
         timestep: int,
-        sample: Union[torch.FloatTensor, np.ndarray],
-    ):
+        sample: torch.FloatTensor,
+        return_dict: bool = True,
+    ) -> Union[SchedulerOutput, Tuple]:
         """
         Step function propagating the sample with the Runge-Kutta method. RK takes 4 forward passes to approximate the
         solution to the differential equation.
+
+        Args:
+            model_output (`torch.FloatTensor`): direct output from learned diffusion model.
+            timestep (`int`): current discrete timestep in the diffusion chain.
+            sample (`torch.FloatTensor`):
+                current instance of sample being created by diffusion process.
+            return_dict (`bool`): option for returning tuple rather than SchedulerOutput class
+
+        Returns:
+            [`~scheduling_utils.SchedulerOutput`] or `tuple`: [`~scheduling_utils.SchedulerOutput`] if `return_dict` is
+            True, otherwise a `tuple`. When returning a tuple, the first element is the sample tensor.
+
         """
         if self.num_inference_steps is None:
             raise ValueError(
@@ -155,7 +249,7 @@ class PNDMScheduler(SchedulerMixin, ConfigMixin):
             )
 
         diff_to_prev = 0 if self.counter % 2 else self.config.num_train_timesteps // self.num_inference_steps // 2
-        prev_timestep = max(timestep - diff_to_prev, self.prk_timesteps[-1])
+        prev_timestep = timestep - diff_to_prev
         timestep = self.prk_timesteps[self.counter // 4 * 4]
 
         if self.counter % 4 == 0:
@@ -176,17 +270,33 @@ class PNDMScheduler(SchedulerMixin, ConfigMixin):
         prev_sample = self._get_prev_sample(cur_sample, timestep, prev_timestep, model_output)
         self.counter += 1
 
-        return {"prev_sample": prev_sample}
+        if not return_dict:
+            return (prev_sample,)
+
+        return SchedulerOutput(prev_sample=prev_sample)
 
     def step_plms(
         self,
-        model_output: Union[torch.FloatTensor, np.ndarray],
+        model_output: torch.FloatTensor,
         timestep: int,
-        sample: Union[torch.FloatTensor, np.ndarray],
-    ):
+        sample: torch.FloatTensor,
+        return_dict: bool = True,
+    ) -> Union[SchedulerOutput, Tuple]:
         """
         Step function propagating the sample with the linear multi-step method. This has one forward pass with multiple
         times to approximate the solution.
+
+        Args:
+            model_output (`torch.FloatTensor`): direct output from learned diffusion model.
+            timestep (`int`): current discrete timestep in the diffusion chain.
+            sample (`torch.FloatTensor`):
+                current instance of sample being created by diffusion process.
+            return_dict (`bool`): option for returning tuple rather than SchedulerOutput class
+
+        Returns:
+            [`~scheduling_utils.SchedulerOutput`] or `tuple`: [`~scheduling_utils.SchedulerOutput`] if `return_dict` is
+            True, otherwise a `tuple`. When returning a tuple, the first element is the sample tensor.
+
         """
         if self.num_inference_steps is None:
             raise ValueError(
@@ -201,9 +311,10 @@ class PNDMScheduler(SchedulerMixin, ConfigMixin):
                 "for more information."
             )
 
-        prev_timestep = max(timestep - self.config.num_train_timesteps // self.num_inference_steps, 0)
+        prev_timestep = timestep - self.config.num_train_timesteps // self.num_inference_steps
 
         if self.counter != 1:
+            self.ets = self.ets[-3:]
             self.ets.append(model_output)
         else:
             prev_timestep = timestep
@@ -226,9 +337,25 @@ class PNDMScheduler(SchedulerMixin, ConfigMixin):
         prev_sample = self._get_prev_sample(sample, timestep, prev_timestep, model_output)
         self.counter += 1
 
-        return {"prev_sample": prev_sample}
+        if not return_dict:
+            return (prev_sample,)
 
-    def _get_prev_sample(self, sample, timestep, timestep_prev, model_output):
+        return SchedulerOutput(prev_sample=prev_sample)
+
+    def scale_model_input(self, sample: torch.FloatTensor, *args, **kwargs) -> torch.FloatTensor:
+        """
+        Ensures interchangeability with schedulers that need to scale the denoising model input depending on the
+        current timestep.
+
+        Args:
+            sample (`torch.FloatTensor`): input sample
+
+        Returns:
+            `torch.FloatTensor`: scaled input sample
+        """
+        return sample
+
+    def _get_prev_sample(self, sample, timestep, prev_timestep, model_output):
         # See formula (9) of PNDM paper https://arxiv.org/pdf/2202.09778.pdf
         # this function computes x_(t−δ) using the formula of (9)
         # Note that x_t needs to be added to both sides of the equation
@@ -241,10 +368,17 @@ class PNDMScheduler(SchedulerMixin, ConfigMixin):
         # sample -> x_t
         # model_output -> e_θ(x_t, t)
         # prev_sample -> x_(t−δ)
-        alpha_prod_t = self.alphas_cumprod[timestep + 1 - self._offset]
-        alpha_prod_t_prev = self.alphas_cumprod[timestep_prev + 1 - self._offset]
+        alpha_prod_t = self.alphas_cumprod[timestep]
+        alpha_prod_t_prev = self.alphas_cumprod[prev_timestep] if prev_timestep >= 0 else self.final_alpha_cumprod
         beta_prod_t = 1 - alpha_prod_t
         beta_prod_t_prev = 1 - alpha_prod_t_prev
+
+        if self.config.prediction_type == "v_prediction":
+            model_output = (alpha_prod_t**0.5) * model_output + (beta_prod_t**0.5) * sample
+        elif self.config.prediction_type != "epsilon":
+            raise ValueError(
+                f"prediction_type given as {self.config.prediction_type} must be one of `epsilon` or `v_prediction`"
+            )
 
         # corresponds to (α_(t−δ) - α_t) divided by
         # denominator of x_t in formula (9) and plus 1
@@ -264,11 +398,26 @@ class PNDMScheduler(SchedulerMixin, ConfigMixin):
 
         return prev_sample
 
-    def add_noise(self, original_samples, noise, timesteps):
-        sqrt_alpha_prod = self.alphas_cumprod[timesteps] ** 0.5
-        sqrt_alpha_prod = self.match_shape(sqrt_alpha_prod, original_samples)
-        sqrt_one_minus_alpha_prod = (1 - self.alphas_cumprod[timesteps]) ** 0.5
-        sqrt_one_minus_alpha_prod = self.match_shape(sqrt_one_minus_alpha_prod, original_samples)
+    # Copied from diffusers.schedulers.scheduling_ddpm.DDPMScheduler.add_noise
+    def add_noise(
+        self,
+        original_samples: torch.FloatTensor,
+        noise: torch.FloatTensor,
+        timesteps: torch.IntTensor,
+    ) -> torch.FloatTensor:
+        # Make sure alphas_cumprod and timestep have same device and dtype as original_samples
+        alphas_cumprod = self.alphas_cumprod.to(device=original_samples.device, dtype=original_samples.dtype)
+        timesteps = timesteps.to(original_samples.device)
+
+        sqrt_alpha_prod = alphas_cumprod[timesteps] ** 0.5
+        sqrt_alpha_prod = sqrt_alpha_prod.flatten()
+        while len(sqrt_alpha_prod.shape) < len(original_samples.shape):
+            sqrt_alpha_prod = sqrt_alpha_prod.unsqueeze(-1)
+
+        sqrt_one_minus_alpha_prod = (1 - alphas_cumprod[timesteps]) ** 0.5
+        sqrt_one_minus_alpha_prod = sqrt_one_minus_alpha_prod.flatten()
+        while len(sqrt_one_minus_alpha_prod.shape) < len(original_samples.shape):
+            sqrt_one_minus_alpha_prod = sqrt_one_minus_alpha_prod.unsqueeze(-1)
 
         noisy_samples = sqrt_alpha_prod * original_samples + sqrt_one_minus_alpha_prod * noise
         return noisy_samples

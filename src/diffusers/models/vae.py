@@ -1,10 +1,38 @@
+# Copyright 2023 The HuggingFace Team. All rights reserved.
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#     http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+from dataclasses import dataclass
+from typing import Optional
+
 import numpy as np
 import torch
 import torch.nn as nn
 
-from ..configuration_utils import ConfigMixin, register_to_config
-from ..modeling_utils import ModelMixin
-from .unet_blocks import UNetMidBlock2D, get_down_block, get_up_block
+from ..utils import BaseOutput, randn_tensor
+from .unet_2d_blocks import UNetMidBlock2D, get_down_block, get_up_block
+
+
+@dataclass
+class DecoderOutput(BaseOutput):
+    """
+    Output of decoding method.
+
+    Args:
+        sample (`torch.FloatTensor` of shape `(batch_size, num_channels, height, width)`):
+            Decoded output sample of the model. Output of the last layer of the model.
+    """
+
+    sample: torch.FloatTensor
 
 
 class Encoder(nn.Module):
@@ -15,13 +43,20 @@ class Encoder(nn.Module):
         down_block_types=("DownEncoderBlock2D",),
         block_out_channels=(64,),
         layers_per_block=2,
+        norm_num_groups=32,
         act_fn="silu",
         double_z=True,
     ):
         super().__init__()
         self.layers_per_block = layers_per_block
 
-        self.conv_in = torch.nn.Conv2d(in_channels, block_out_channels[0], kernel_size=3, stride=1, padding=1)
+        self.conv_in = torch.nn.Conv2d(
+            in_channels,
+            block_out_channels[0],
+            kernel_size=3,
+            stride=1,
+            padding=1,
+        )
 
         self.mid_block = None
         self.down_blocks = nn.ModuleList([])
@@ -42,6 +77,7 @@ class Encoder(nn.Module):
                 resnet_eps=1e-6,
                 downsample_padding=0,
                 resnet_act_fn=act_fn,
+                resnet_groups=norm_num_groups,
                 attn_num_head_channels=None,
                 temb_channels=None,
             )
@@ -55,28 +91,45 @@ class Encoder(nn.Module):
             output_scale_factor=1,
             resnet_time_scale_shift="default",
             attn_num_head_channels=None,
-            resnet_groups=32,
+            resnet_groups=norm_num_groups,
             temb_channels=None,
         )
 
         # out
-        num_groups_out = 32
-        self.conv_norm_out = nn.GroupNorm(num_channels=block_out_channels[-1], num_groups=num_groups_out, eps=1e-6)
+        self.conv_norm_out = nn.GroupNorm(num_channels=block_out_channels[-1], num_groups=norm_num_groups, eps=1e-6)
         self.conv_act = nn.SiLU()
 
         conv_out_channels = 2 * out_channels if double_z else out_channels
         self.conv_out = nn.Conv2d(block_out_channels[-1], conv_out_channels, 3, padding=1)
 
+        self.gradient_checkpointing = False
+
     def forward(self, x):
         sample = x
         sample = self.conv_in(sample)
 
-        # down
-        for down_block in self.down_blocks:
-            sample = down_block(sample)
+        if self.training and self.gradient_checkpointing:
 
-        # middle
-        sample = self.mid_block(sample)
+            def create_custom_forward(module):
+                def custom_forward(*inputs):
+                    return module(*inputs)
+
+                return custom_forward
+
+            # down
+            for down_block in self.down_blocks:
+                sample = torch.utils.checkpoint.checkpoint(create_custom_forward(down_block), sample)
+
+            # middle
+            sample = torch.utils.checkpoint.checkpoint(create_custom_forward(self.mid_block), sample)
+
+        else:
+            # down
+            for down_block in self.down_blocks:
+                sample = down_block(sample)
+
+            # middle
+            sample = self.mid_block(sample)
 
         # post-process
         sample = self.conv_norm_out(sample)
@@ -94,12 +147,19 @@ class Decoder(nn.Module):
         up_block_types=("UpDecoderBlock2D",),
         block_out_channels=(64,),
         layers_per_block=2,
+        norm_num_groups=32,
         act_fn="silu",
     ):
         super().__init__()
         self.layers_per_block = layers_per_block
 
-        self.conv_in = nn.Conv2d(in_channels, block_out_channels[-1], kernel_size=3, stride=1, padding=1)
+        self.conv_in = nn.Conv2d(
+            in_channels,
+            block_out_channels[-1],
+            kernel_size=3,
+            stride=1,
+            padding=1,
+        )
 
         self.mid_block = None
         self.up_blocks = nn.ModuleList([])
@@ -112,7 +172,7 @@ class Decoder(nn.Module):
             output_scale_factor=1,
             resnet_time_scale_shift="default",
             attn_num_head_channels=None,
-            resnet_groups=32,
+            resnet_groups=norm_num_groups,
             temb_channels=None,
         )
 
@@ -134,6 +194,7 @@ class Decoder(nn.Module):
                 add_upsample=not is_final_block,
                 resnet_eps=1e-6,
                 resnet_act_fn=act_fn,
+                resnet_groups=norm_num_groups,
                 attn_num_head_channels=None,
                 temb_channels=None,
             )
@@ -141,21 +202,37 @@ class Decoder(nn.Module):
             prev_output_channel = output_channel
 
         # out
-        num_groups_out = 32
-        self.conv_norm_out = nn.GroupNorm(num_channels=block_out_channels[0], num_groups=num_groups_out, eps=1e-6)
+        self.conv_norm_out = nn.GroupNorm(num_channels=block_out_channels[0], num_groups=norm_num_groups, eps=1e-6)
         self.conv_act = nn.SiLU()
         self.conv_out = nn.Conv2d(block_out_channels[0], out_channels, 3, padding=1)
+
+        self.gradient_checkpointing = False
 
     def forward(self, z):
         sample = z
         sample = self.conv_in(sample)
 
-        # middle
-        sample = self.mid_block(sample)
+        if self.training and self.gradient_checkpointing:
 
-        # up
-        for up_block in self.up_blocks:
-            sample = up_block(sample)
+            def create_custom_forward(module):
+                def custom_forward(*inputs):
+                    return module(*inputs)
+
+                return custom_forward
+
+            # middle
+            sample = torch.utils.checkpoint.checkpoint(create_custom_forward(self.mid_block), sample)
+
+            # up
+            for up_block in self.up_blocks:
+                sample = torch.utils.checkpoint.checkpoint(create_custom_forward(up_block), sample)
+        else:
+            # middle
+            sample = self.mid_block(sample)
+
+            # up
+            for up_block in self.up_blocks:
+                sample = up_block(sample)
 
         # post-process
         sample = self.conv_norm_out(sample)
@@ -174,14 +251,16 @@ class VectorQuantizer(nn.Module):
     # NOTE: due to a bug the beta term was applied to the wrong term. for
     # backwards compatibility we use the buggy version by default, but you can
     # specify legacy=False to fix it.
-    def __init__(self, n_e, e_dim, beta, remap=None, unknown_index="random", sane_index_shape=False, legacy=True):
+    def __init__(
+        self, n_e, vq_embed_dim, beta, remap=None, unknown_index="random", sane_index_shape=False, legacy=True
+    ):
         super().__init__()
         self.n_e = n_e
-        self.e_dim = e_dim
+        self.vq_embed_dim = vq_embed_dim
         self.beta = beta
         self.legacy = legacy
 
-        self.embedding = nn.Embedding(self.n_e, self.e_dim)
+        self.embedding = nn.Embedding(self.n_e, self.vq_embed_dim)
         self.embedding.weight.data.uniform_(-1.0 / self.n_e, 1.0 / self.n_e)
 
         self.remap = remap
@@ -228,16 +307,11 @@ class VectorQuantizer(nn.Module):
     def forward(self, z):
         # reshape z -> (batch, height, width, channel) and flatten
         z = z.permute(0, 2, 3, 1).contiguous()
-        z_flattened = z.view(-1, self.e_dim)
+        z_flattened = z.view(-1, self.vq_embed_dim)
+
         # distances from z to embeddings e_j (z - e)^2 = z^2 + e^2 - 2 e * z
+        min_encoding_indices = torch.argmin(torch.cdist(z_flattened, self.embedding.weight), dim=1)
 
-        d = (
-            torch.sum(z_flattened**2, dim=1, keepdim=True)
-            + torch.sum(self.embedding.weight**2, dim=1)
-            - 2 * torch.einsum("bd,dn->bn", z_flattened, self.embedding.weight.t())
-        )
-
-        min_encoding_indices = torch.argmin(d, dim=1)
         z_q = self.embedding(min_encoding_indices).view(z.shape)
         perplexity = None
         min_encodings = None
@@ -291,10 +365,16 @@ class DiagonalGaussianDistribution(object):
         self.std = torch.exp(0.5 * self.logvar)
         self.var = torch.exp(self.logvar)
         if self.deterministic:
-            self.var = self.std = torch.zeros_like(self.mean).to(device=self.parameters.device)
+            self.var = self.std = torch.zeros_like(
+                self.mean, device=self.parameters.device, dtype=self.parameters.dtype
+            )
 
-    def sample(self, generator=None):
-        x = self.mean + self.std * torch.randn(self.mean.shape, generator=generator, device=self.parameters.device)
+    def sample(self, generator: Optional[torch.Generator] = None) -> torch.FloatTensor:
+        # make sure sample is on the same device as the parameters and has same dtype
+        sample = randn_tensor(
+            self.mean.shape, generator=generator, device=self.parameters.device, dtype=self.parameters.dtype
+        )
+        x = self.mean + self.std * sample
         return x
 
     def kl(self, other=None):
@@ -321,131 +401,3 @@ class DiagonalGaussianDistribution(object):
 
     def mode(self):
         return self.mean
-
-
-class VQModel(ModelMixin, ConfigMixin):
-    @register_to_config
-    def __init__(
-        self,
-        in_channels=3,
-        out_channels=3,
-        down_block_types=("DownEncoderBlock2D",),
-        up_block_types=("UpDecoderBlock2D",),
-        block_out_channels=(64,),
-        layers_per_block=1,
-        act_fn="silu",
-        latent_channels=3,
-        sample_size=32,
-        num_vq_embeddings=256,
-    ):
-        super().__init__()
-
-        # pass init params to Encoder
-        self.encoder = Encoder(
-            in_channels=in_channels,
-            out_channels=latent_channels,
-            down_block_types=down_block_types,
-            block_out_channels=block_out_channels,
-            layers_per_block=layers_per_block,
-            act_fn=act_fn,
-            double_z=False,
-        )
-
-        self.quant_conv = torch.nn.Conv2d(latent_channels, latent_channels, 1)
-        self.quantize = VectorQuantizer(
-            num_vq_embeddings, latent_channels, beta=0.25, remap=None, sane_index_shape=False
-        )
-        self.post_quant_conv = torch.nn.Conv2d(latent_channels, latent_channels, 1)
-
-        # pass init params to Decoder
-        self.decoder = Decoder(
-            in_channels=latent_channels,
-            out_channels=out_channels,
-            up_block_types=up_block_types,
-            block_out_channels=block_out_channels,
-            layers_per_block=layers_per_block,
-            act_fn=act_fn,
-        )
-
-    def encode(self, x):
-        h = self.encoder(x)
-        h = self.quant_conv(h)
-        return h
-
-    def decode(self, h, force_not_quantize=False):
-        # also go through quantization layer
-        if not force_not_quantize:
-            quant, emb_loss, info = self.quantize(h)
-        else:
-            quant = h
-        quant = self.post_quant_conv(quant)
-        dec = self.decoder(quant)
-        return dec
-
-    def forward(self, sample):
-        x = sample
-        h = self.encode(x)
-        dec = self.decode(h)
-        return dec
-
-
-class AutoencoderKL(ModelMixin, ConfigMixin):
-    @register_to_config
-    def __init__(
-        self,
-        in_channels=3,
-        out_channels=3,
-        down_block_types=("DownEncoderBlock2D",),
-        up_block_types=("UpDecoderBlock2D",),
-        block_out_channels=(64,),
-        layers_per_block=1,
-        act_fn="silu",
-        latent_channels=4,
-        sample_size=32,
-    ):
-        super().__init__()
-
-        # pass init params to Encoder
-        self.encoder = Encoder(
-            in_channels=in_channels,
-            out_channels=latent_channels,
-            down_block_types=down_block_types,
-            block_out_channels=block_out_channels,
-            layers_per_block=layers_per_block,
-            act_fn=act_fn,
-            double_z=True,
-        )
-
-        # pass init params to Decoder
-        self.decoder = Decoder(
-            in_channels=latent_channels,
-            out_channels=out_channels,
-            up_block_types=up_block_types,
-            block_out_channels=block_out_channels,
-            layers_per_block=layers_per_block,
-            act_fn=act_fn,
-        )
-
-        self.quant_conv = torch.nn.Conv2d(2 * latent_channels, 2 * latent_channels, 1)
-        self.post_quant_conv = torch.nn.Conv2d(latent_channels, latent_channels, 1)
-
-    def encode(self, x):
-        h = self.encoder(x)
-        moments = self.quant_conv(h)
-        posterior = DiagonalGaussianDistribution(moments)
-        return posterior
-
-    def decode(self, z):
-        z = self.post_quant_conv(z)
-        dec = self.decoder(z)
-        return dec
-
-    def forward(self, sample, sample_posterior=False):
-        x = sample
-        posterior = self.encode(x)
-        if sample_posterior:
-            z = posterior.sample()
-        else:
-            z = posterior.mode()
-        dec = self.decode(z)
-        return dec
