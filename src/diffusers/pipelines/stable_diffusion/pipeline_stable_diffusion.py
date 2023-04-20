@@ -678,7 +678,7 @@ class StableDiffusionPipeline(DiffusionPipeline, TextualInversionLoaderMixin, Lo
                     t,
                     encoder_hidden_states=prompt_embeds,
                     cross_attention_kwargs=cross_attention_kwargs,
-                ).sample
+                )
 
                 # perform guidance
                 if do_classifier_free_guidance:
@@ -686,23 +686,22 @@ class StableDiffusionPipeline(DiffusionPipeline, TextualInversionLoaderMixin, Lo
                     noise_pred = noise_pred_uncond + guidance_scale * (noise_pred_text - noise_pred_uncond)
 
                 # compute the previous noisy sample x_t -> x_t-1
-                latents = self.scheduler.step(noise_pred, t, latents, **extra_step_kwargs).prev_sample
+                latents = self.scheduler.step(noise_pred, t, latents, **extra_step_kwargs)["prev_sample"]
 
                 # call the callback, if provided
                 if i == len(timesteps) - 1 or ((i + 1) > num_warmup_steps and (i + 1) % self.scheduler.order == 0):
                     progress_bar.update()
                     if callback is not None and i % callback_steps == 0:
                         callback(i, t, latents)
-
+        has_nsfw_concept = None
         if output_type == "latent":
             image = latents
-            has_nsfw_concept = None
         elif output_type == "pil":
             # 8. Post-processing
             image = self.decode_latents(latents)
 
             # 9. Run safety checker
-            image, has_nsfw_concept = self.run_safety_checker(image, device, prompt_embeds.dtype)
+            #image, has_nsfw_concept = self.run_safety_checker(image, device, prompt_embeds.dtype)
 
             # 10. Convert to PIL
             image = self.numpy_to_pil(image)
@@ -711,7 +710,7 @@ class StableDiffusionPipeline(DiffusionPipeline, TextualInversionLoaderMixin, Lo
             image = self.decode_latents(latents)
 
             # 9. Run safety checker
-            image, has_nsfw_concept = self.run_safety_checker(image, device, prompt_embeds.dtype)
+            #image, has_nsfw_concept = self.run_safety_checker(image, device, prompt_embeds.dtype)
 
         # Offload last model to CPU
         if hasattr(self, "final_offload_hook") and self.final_offload_hook is not None:
