@@ -23,7 +23,6 @@ class StableDiffusionPipeline(DiffusionPipeline):
         feature_extractor: Optional[CLIPFeatureExtractor] = None
     ):
         super().__init__()
-        scheduler = scheduler.set_format(format)
         self.register_modules(
             vae=vae,
             text_encoder=text_encoder,
@@ -63,7 +62,6 @@ class StableDiffusionPipeline(DiffusionPipeline):
         onnx = False
         if "execution_provider" in kwargs:
             onnx = True
-            self.scheduler = self.scheduler.set_format("np")
             ep = kwargs.pop("execution_provider")
             import onnxruntime as ort
             so = ort.SessionOptions()
