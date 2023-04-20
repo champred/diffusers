@@ -6,13 +6,13 @@
 Before running the scripts, make sure to install the library's dependencies & this updated diffusers code (Python 3.8 is recommended):
 
 ```bash
-git clone https://github.com/harishanand95/diffusers.git
+git clone https://github.com/champred/diffusers.git
 cd diffusers && git checkout dml && pip install -e .
 pip install transformers ftfy scipy
 ```
 
 ## Download onnxruntime-directml 
-From this link https://aiinfra.visualstudio.com/PublicPackages/_artifacts/feed/ORT-Nightly/PyPI/ort-nightly-directml/overview/1.13.0.dev20220830001
+From [this link](https://aiinfra.visualstudio.com/PublicPackages/_artifacts/feed/ORT-Nightly/PyPI/ort-nightly-directml/overview/)
 , download the onnxruntime nightly directml packages. You can know the python version using `python --version` command.
 
 - If you are on Python3.7 download the file that ends with **-cp37-cp37m-win_amd64.whl
@@ -26,20 +26,30 @@ pip install ort_nightly_directml-1.13.0.dev20220830001-cp39-cp39-win_amd64.whl
 
 An error message like this `ERROR: ort_nightly_directml-1.13.0.dev20220830001-cp38-cp38-win_amd64.whl is not a supported wheel on this platform.` means that there is mismatch in python version and the downloaded package supported python version.
 
-## Create ONNX files
-This step requires huggingface token. ALl onnx files are created in a folder named onnx in `examples/inference`
+### Optional: Create Diffusers Model from CKPT
+If you have a `model.ckpt` and `config.yaml` you can save it in the Diffusers format with [this conversion script](/scripts/convert_original_stable_diffusion_to_diffusers.py).
 
 ```bash
-cd diffusers/examples/inference/
+cd scripts
+mkdir converted
+python convert_original_stable_diffusion_to_diffusers.py --checkpoint_path /path/to/model.ckpt --original_config_file /path/to/config.yaml --scheduler_type euler --dump_path converted
+```
+
+After the model has been exported, update line 15 in `save_onnx.py` to point to the exported path.
+
+## Create ONNX files
+This step requires a [Hugging Face token](https://huggingface.co/settings/tokens) if you are not importing a local model. All ONNX files are created in a folder named onnx in `examples/inference`.
+
+```bash
+huggingface-cli login
+cd examples/inference/
 python save_onnx.py 
 ```
 
 ## Run using ONNX files
 Run the onnx model using DirectML Execution Provider. Please check the last few lines in `dml_onnx.py` to see the examples.
-Currently only 512x512 image is supported. 
 
 ```bash
-cd diffusers/examples/inference/
 python dml_onnx.py 
 ```
 
